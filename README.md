@@ -12,7 +12,7 @@ AI-powered, self-healing test automation engine built on Playwright. Record brow
 - **Healing Telemetry** — Structured JSON logs for every heal: method, similarity score, duration, token usage
 - **Healing Cache** — Healed selectors are cached in-memory and persisted to the test file in `auto_update` mode
 
-## Architecture
+## Architecture 
 
 ```
 CLI (cli.py)
