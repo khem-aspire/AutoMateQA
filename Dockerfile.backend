@@ -1,0 +1,48 @@
+FROM python:3.12-slim AS backend
+
+WORKDIR /app
+
+# System dependencies for Playwright + MySQL client
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    wget \
+    gnupg \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    libxshmfence1 \
+    fonts-liberation \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (engine + server)
+COPY requirements.txt /app/requirements.txt
+COPY server/requirements.txt /app/server/requirements.txt
+RUN pip install --no-cache-dir --timeout=300 --retries=5 -r requirements.txt -r server/requirements.txt
+
+# Install Playwright browsers (chromium only to keep image small)
+RUN playwright install chromium && playwright install-deps chromium
+
+# Copy application code
+COPY engine/ /app/engine/
+COPY server/ /app/server/
+COPY cli.py /app/cli.py
+
+# Expose port
+EXPOSE 8000
+
+# Entrypoint script handles migrations + server start
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

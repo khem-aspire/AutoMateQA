@@ -1,5 +1,13 @@
 playwright>=1.49.0
 pydantic>=2.10.0
+pydantic-settings>=2.7.0
 openai>=1.58.0
 click>=8.1.0
 rich>=13.9.0
+# Optional: multi-model LLM support (Phase 13)
+anthropic>=0.40.0
+# Optional: visual regression (Phase 17)
+Pillow>=10.0.0
+# API assertions (Phase 1): JSONPath + JSON schema
+jsonpath-ng>=1.6.1
+jsonschema>=4.23.0

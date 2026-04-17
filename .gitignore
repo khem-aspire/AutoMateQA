@@ -34,3 +34,23 @@ screenshots/
 
 # Cursor
 .cursor/
+
+# Dashboard
+dashboard/node_modules/
+dashboard/dist/
+
+# Server runtime
+server/uploads/
+server/data/
+
+# Docker
+mysql_data/
+minio_data/
+# Added by code-review-graph
+.code-review-graph/
+
+.claude/
+.mcp.json
+AGENTS.md
+CLAUDE.md
+*.aqa

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+
+# Node
+dashboard/node_modules/
+dashboard/dist/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Runtime artifacts
+screenshots/
+*.png
+*.har
+trace.zip
+report.html
+
+# Docker
+docker-compose.yml
+Dockerfile.*
+
+# Misc
+.DS_Store
+*.md
+tests/

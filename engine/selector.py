@@ -54,6 +54,14 @@ _DYNAMIC_ID_RE = re.compile(
 # Common testing-library attribute names (in priority order).
 _TEST_ATTRS = ["data-cy", "data-test", "data-qa", "data-test-id", "data-testid"]
 
+# Playwright-native locator confidence values (Phase 4)
+_PW_LOCATOR_CONFIDENCE: dict[str, float] = {
+    "pw_test_id": 0.97,
+    "pw_label": 0.92,
+    "pw_role": 0.89,
+    "pw_placeholder": 0.84,
+}
+
 
 @dataclass
 class SelectorCandidate:
@@ -266,6 +274,12 @@ class SelectorEngine:
             ("role+name", self._strategy_role),
             ("aria-label", self._strategy_aria),
             ("placeholder", self._strategy_placeholder),
+            ("pw-test-id", self._strategy_pw_test_id),
+            ("pw-label", self._strategy_pw_label),
+            ("pw-role", self._strategy_pw_role),
+            ("pw-placeholder", self._strategy_pw_placeholder),
+            ("shadow-pierce", self._strategy_shadow_pierce),
+            ("frame-locator", self._strategy_frame_locator),
             ("text-exact", self._strategy_text),
             ("tag+text", self._strategy_tag_text),
             ("css", self._strategy_css),
@@ -305,6 +319,24 @@ class SelectorEngine:
         self, page: Page, fp: ElementFingerprint
     ) -> Optional[SelectorCandidate]:
         """Try selectors that were computed at record time, in priority order."""
+        if not fp.selectors and not fp.playwright_locators:
+            return None
+
+        # Try playwright_locators first (validated at record time)
+        if fp.playwright_locators:
+            for try_fn in (
+                self._strategy_pw_test_id,
+                self._strategy_pw_label,
+                self._strategy_pw_role,
+                self._strategy_pw_placeholder,
+            ):
+                try:
+                    candidate = await try_fn(page, fp)
+                    if candidate:
+                        return candidate
+                except Exception:
+                    continue
+
         if not fp.selectors:
             return None
 
@@ -692,6 +724,164 @@ class SelectorEngine:
                 ),
                 strategy="xpath",
             )
+        return None
+
+    # ------------------------------------------------------------------
+    # Playwright-native strategies (Phase 4)
+    # ------------------------------------------------------------------
+
+    async def _strategy_pw_test_id(
+        self, page: Page, fp: ElementFingerprint,
+    ) -> Optional[SelectorCandidate]:
+        test_id = fp.playwright_locators.get("test_id") or fp.data_testid
+        if not test_id:
+            return None
+        locator = page.get_by_test_id(test_id)
+        count = await locator.count()
+        if count == 1:
+            return SelectorCandidate(
+                locator=locator,
+                selector=f'get_by_test_id("{test_id}")',
+                confidence=_PW_LOCATOR_CONFIDENCE["pw_test_id"],
+                strategy="pw-test-id",
+            )
+        if count > 1:
+            narrowed = await self._narrow_by_text(locator, fp)
+            if narrowed:
+                return SelectorCandidate(
+                    locator=narrowed,
+                    selector=f'get_by_test_id("{test_id}") + text',
+                    confidence=round(_PW_LOCATOR_CONFIDENCE["pw_test_id"] * 0.9, 2),
+                    strategy="pw-test-id+text",
+                )
+        return None
+
+    async def _strategy_pw_label(
+        self, page: Page, fp: ElementFingerprint,
+    ) -> Optional[SelectorCandidate]:
+        label = fp.playwright_locators.get("label") or (
+            fp.accessible_name if fp.tag_name in ("input", "select", "textarea") else ""
+        )
+        if not label:
+            return None
+        locator = page.get_by_label(label)
+        if await locator.count() == 1:
+            return SelectorCandidate(
+                locator=locator,
+                selector=f'get_by_label("{label}")',
+                confidence=_PW_LOCATOR_CONFIDENCE["pw_label"],
+                strategy="pw-label",
+            )
+        return None
+
+    async def _strategy_pw_role(
+        self, page: Page, fp: ElementFingerprint,
+    ) -> Optional[SelectorCandidate]:
+        role = fp.playwright_locators.get("role") or fp.role
+        if not role:
+            return None
+        name = (
+            fp.playwright_locators.get("role_name")
+            or fp.accessible_name
+            or fp.aria_label
+            or (fp.text_content[:50] if fp.text_content else None)
+        )
+        locator = page.get_by_role(role, name=name) if name else page.get_by_role(role)
+        count = await locator.count()
+        if count == 1:
+            sel = f'get_by_role("{role}", name="{name}")' if name else f'get_by_role("{role}")'
+            return SelectorCandidate(
+                locator=locator, selector=sel,
+                confidence=_PW_LOCATOR_CONFIDENCE["pw_role"],
+                strategy="pw-role",
+            )
+        if count > 1 and name:
+            locator_exact = page.get_by_role(role, name=name, exact=True)
+            if await locator_exact.count() == 1:
+                return SelectorCandidate(
+                    locator=locator_exact,
+                    selector=f'get_by_role("{role}", name="{name}", exact=True)',
+                    confidence=_PW_LOCATOR_CONFIDENCE["pw_role"],
+                    strategy="pw-role-exact",
+                )
+        return None
+
+    async def _strategy_pw_placeholder(
+        self, page: Page, fp: ElementFingerprint,
+    ) -> Optional[SelectorCandidate]:
+        placeholder = fp.playwright_locators.get("placeholder") or fp.placeholder
+        if not placeholder:
+            return None
+        locator = page.get_by_placeholder(placeholder, exact=True)
+        if await locator.count() == 1:
+            return SelectorCandidate(
+                locator=locator,
+                selector=f'get_by_placeholder("{placeholder}", exact=True)',
+                confidence=_PW_LOCATOR_CONFIDENCE["pw_placeholder"],
+                strategy="pw-placeholder",
+            )
+        locator_sub = page.get_by_placeholder(placeholder)
+        if await locator_sub.count() == 1:
+            return SelectorCandidate(
+                locator=locator_sub,
+                selector=f'get_by_placeholder("{placeholder}")',
+                confidence=round(_PW_LOCATOR_CONFIDENCE["pw_placeholder"] * 0.92, 2),
+                strategy="pw-placeholder-sub",
+            )
+        return None
+
+    # ------------------------------------------------------------------
+    # Shadow DOM and iframe strategies (Phase 8)
+    # ------------------------------------------------------------------
+
+    async def _strategy_shadow_pierce(
+        self, page: Page, fp: ElementFingerprint,
+    ) -> Optional[SelectorCandidate]:
+        if not fp.is_shadow_dom or not fp.shadow_host_selector:
+            return None
+        inner = fp.css_selector or (
+            f'[data-testid="{fp.data_testid}"]' if fp.data_testid else ""
+        )
+        if not inner:
+            return None
+        pierce = f"{fp.shadow_host_selector} >> {inner}"
+        try:
+            locator = page.locator(pierce)
+            if await locator.count() == 1:
+                return SelectorCandidate(
+                    locator=locator, selector=pierce,
+                    confidence=0.82, strategy="shadow-pierce",
+                )
+        except Exception:
+            pass
+        return None
+
+    async def _strategy_frame_locator(
+        self, page: Page, fp: ElementFingerprint,
+    ) -> Optional[SelectorCandidate]:
+        if not fp.frame_url and fp.frame_index < 0 and not fp.frame_name:
+            return None
+        try:
+            if fp.frame_name:
+                frame = page.frame_locator(f'iframe[name="{fp.frame_name}"]')
+            elif fp.frame_url:
+                url_part = fp.frame_url.rstrip("/").split("/")[-1]
+                frame = page.frame_locator(f'iframe[src*="{url_part}"]')
+            else:
+                frame = page.frame_locator(f"iframe >> nth={fp.frame_index}")
+            inner = (
+                f'[data-testid="{fp.data_testid}"]' if fp.data_testid else fp.css_selector
+            )
+            if not inner:
+                return None
+            locator = frame.locator(inner)
+            if await locator.count() == 1:
+                return SelectorCandidate(
+                    locator=locator, selector=f"frame >> {inner}",
+                    confidence=0.80, strategy="frame-locator",
+                )
+        except Exception:
+            pass
         return None
 
     # ------------------------------------------------------------------

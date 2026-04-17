@@ -52,14 +52,57 @@ class BrowserManager:
     async def launch(self, url: str = "") -> Page:
         """Launch the browser and return the main page."""
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
+
+        # Multi-browser support (Phase 12)
+        launcher = {
+            "chromium": self._playwright.chromium,
+            "firefox": self._playwright.firefox,
+            "webkit": self._playwright.webkit,
+        }.get(self._config.browser_type, self._playwright.chromium)
+
+        self._browser = await launcher.launch(
             headless=self._config.headless,
-            args=["--start-maximized"],
+            args=["--start-maximized"] if self._config.browser_type == "chromium" else [],
+            slow_mo=50 if self._config.verbose else 0,
         )
-        self._context = await self._browser.new_context(
-            viewport=None,  # full-screen in headed mode
-            no_viewport=not self._config.headless,
-        )
+
+        # Build context options (device emulation, locale, storage, HAR, video)
+        context_options: dict[str, Any] = {}
+
+        if self._config.device_name:
+            device = self._playwright.devices.get(self._config.device_name, {})
+            context_options.update(device)
+        elif self._config.viewport_width:
+            context_options["viewport"] = {
+                "width": self._config.viewport_width,
+                "height": self._config.viewport_height or 900,
+            }
+        else:
+            context_options["viewport"] = None
+            context_options["no_viewport"] = not self._config.headless
+
+        if self._config.locale:
+            context_options["locale"] = self._config.locale
+        if self._config.timezone:
+            context_options["timezone_id"] = self._config.timezone
+        if self._config.storage_state_path:
+            from pathlib import Path as _P
+            if _P(self._config.storage_state_path).exists():
+                context_options["storage_state"] = self._config.storage_state_path
+        if self._config.record_video:
+            context_options["record_video_dir"] = self._config.video_dir
+        if self._config.record_har:
+            context_options["record_har_path"] = self._config.har_path
+            context_options["record_har_url_filter"] = "**/*"
+
+        self._context = await self._browser.new_context(**context_options)
+
+        # Start tracing if requested (Phase 5)
+        if self._config.record_trace:
+            await self._context.tracing.start(
+                screenshots=True, snapshots=True, sources=True,
+            )
+            logger.info("Tracing started → %s", self._config.trace_path)
 
         # Cache the JS code
         self._js_code = _JS_LAYER_PATH.read_text(encoding="utf-8")
@@ -93,8 +136,26 @@ class BrowserManager:
 
     async def close(self) -> None:
         """Gracefully shut down browser and Playwright."""
+        # Stop tracing before closing context
+        if self._config.record_trace and self._context:
+            try:
+                await self._context.tracing.stop(path=self._config.trace_path)
+                logger.info("Trace saved → %s", self._config.trace_path)
+            except Exception as e:
+                logger.warning("Failed to stop tracing: %s", e)
+
+        # Save auth state
+        if self._config.save_storage_state and self._config.storage_state_path and self._context:
+            try:
+                await self._context.storage_state(path=self._config.storage_state_path)
+                logger.info("Auth state saved → %s", self._config.storage_state_path)
+            except Exception:
+                pass
+
         if self._browser:
             await self._browser.close()
+            if self._config.record_har:
+                logger.info("HAR saved → %s", self._config.har_path)
         if self._playwright:
             await self._playwright.stop()
         logger.info("Browser closed")
