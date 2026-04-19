@@ -116,7 +116,7 @@ async def update_schedule(schedule_id: int, body: ScheduleUpdate, db: AsyncSessi
         setattr(sched, key, val)
 
     # Recompute next_run_at if cron or timezone changed
-sched.next_run_at = _compute_next_run(sched.cron_expr, sched.timezone)
+    sched.next_run_at = _compute_next_run(sched.cron_expr, sched.timezone)
 
     await db.commit()
     await db.refresh(sched, ["test"])
