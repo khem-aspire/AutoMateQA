@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Path to the JS assertion layer script
 _JS_LAYER_PATH = Path(__file__).parent / "js" / "assertion_layer.js"
+_JS_NETWORK_RECORDER_PATH = Path(__file__).parent / "js" / "network_recorder.js"
 
 
 class BrowserManager:
@@ -62,7 +63,6 @@ class BrowserManager:
 
         self._browser = await launcher.launch(
             headless=self._config.headless,
-            args=["--start-maximized"] if self._config.browser_type == "chromium" else [],
             slow_mo=50 if self._config.verbose else 0,
         )
 
@@ -75,11 +75,10 @@ class BrowserManager:
         elif self._config.viewport_width:
             context_options["viewport"] = {
                 "width": self._config.viewport_width,
-                "height": self._config.viewport_height or 900,
+                "height": self._config.viewport_height or 720,
             }
         else:
-            context_options["viewport"] = None
-            context_options["no_viewport"] = not self._config.headless
+            context_options["viewport"] = {"width": 1280, "height": 720}
 
         if self._config.locale:
             context_options["locale"] = self._config.locale
@@ -106,6 +105,7 @@ class BrowserManager:
 
         # Cache the JS code
         self._js_code = _JS_LAYER_PATH.read_text(encoding="utf-8")
+        self._js_network_code = _JS_NETWORK_RECORDER_PATH.read_text(encoding="utf-8")
 
         # ── CRITICAL ORDER: expose binding BEFORE init script ──
         # This ensures __assertion_bridge is available when the
@@ -115,6 +115,9 @@ class BrowserManager:
             self._handle_assertion_binding,
             handle=False,
         )
+        # Install fetch/XHR shims FIRST so network_recorder is ready before
+        # the app runs and before assertion_layer binds its UI.
+        await self._context.add_init_script(self._js_network_code)
         await self._context.add_init_script(self._js_code)
 
         # Now create the page (init script + binding are already registered)
@@ -189,12 +192,13 @@ class BrowserManager:
     # ------------------------------------------------------------------
 
     async def _inject_on_current_page(self) -> None:
-        """Evaluate the assertion layer JS on the current page directly."""
+        """Evaluate both JS layers on the current page directly."""
         try:
+            await self._page.evaluate(self._js_network_code)
             await self._page.evaluate(self._js_code)
-            logger.debug("Assertion JS layer evaluated on current page")
+            logger.debug("Injected network_recorder + assertion_layer on current page")
         except Exception as e:
-            logger.warning("Failed to evaluate assertion JS: %s", e)
+            logger.warning("Failed to evaluate injected JS: %s", e)
 
     def _on_page_load(self, page: Any) -> None:
         """Re-inject assertion layer after each page load/navigation."""

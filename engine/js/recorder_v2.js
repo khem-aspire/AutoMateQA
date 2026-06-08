@@ -11,6 +11,19 @@
     if (window.__recorderV2Injected) return;
     window.__recorderV2Injected = true;
 
+    // AutoMateQA injects floating UI (FABs, Network Panel) into the page.
+    // Any event whose target lives inside that UI must NOT be recorded as a
+    // user action — it's the tester driving the tool, not the app under test.
+    const AQA_UI_SELECTOR = "#__assertion_fab, #__api_assertion_fab, #__aqa_network_panel, [id^='__aqa_'], [class*='__aqa_']";
+    function __aqaIsToolEvent(target) {
+        try {
+            if (!target || target.nodeType !== 1) {
+                target = (target && target.parentElement) || null;
+            }
+            return !!(target && target.closest && target.closest(AQA_UI_SELECTOR));
+        } catch (_) { return false; }
+    }
+
     // Reuse base recorder's fp() when available (exposed on window by base script).
     // Falls back to minimal fingerprint if base hasn't loaded yet.
     function getFp(el) {
@@ -45,10 +58,12 @@
     // ── Drag & Drop ──
     var _dragSource = null;
     document.addEventListener('dragstart', function (e) {
+        if (__aqaIsToolEvent(e.target)) return;
         _dragSource = e.target;
     }, true);
 
     document.addEventListener('drop', function (e) {
+        if (__aqaIsToolEvent(e.target)) return;
         if (!_dragSource) return;
         if (window.__assertionMode) return;
         e.preventDefault();
@@ -67,6 +82,7 @@
 
     // ── File Upload ──
     document.addEventListener('change', function (e) {
+        if (__aqaIsToolEvent(e.target)) return;
         var el = e.target;
         if (el.tagName !== 'INPUT' || el.type !== 'file') return;
         if (!el.files || el.files.length === 0) return;
@@ -81,6 +97,7 @@
 
     // ── Right-Click (contextmenu) ──
     document.addEventListener('contextmenu', function (e) {
+        if (__aqaIsToolEvent(e.target)) return;
         if (window.__assertionMode) return;
         if (e.target.closest && (
             e.target.closest('#__assertion_menu') ||
@@ -100,6 +117,7 @@
         'Backspace', 'Delete', 'Space', ' '
     ];
     document.addEventListener('keydown', function (e) {
+        if (__aqaIsToolEvent(e.target)) return;
         if (window.__assertionMode) return;
         // Base recorder handles Enter, Tab, Escape
         if (['Enter', 'Tab', 'Escape'].includes(e.key)) return;

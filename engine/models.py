@@ -326,6 +326,7 @@ class AssertionResult(BaseModel):
     confidence: float = 0.0
     healed: bool = False
     diagnostic: dict[str, Any] = Field(default_factory=dict)
+    api_endpoint: str = ""   # "METHOD /path/template" for api_call assertions
 
 
 class StepResult(BaseModel):

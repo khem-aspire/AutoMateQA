@@ -616,15 +616,20 @@ class TestEngine:
                 };
             }
 
+            // AutoMateQA's own injected UI (FABs, Network Panel, builder controls).
+            // Any event inside this UI is the tester driving the tool — never record it.
+            function __aqaIsToolEvent(t) {
+                try {
+                    if (!t || t.nodeType !== 1) t = (t && t.parentElement) || null;
+                    return !!(t && t.closest &&
+                        t.closest('#__assertion_fab, #__assertion_menu, #__assertion_highlight, #__assertion_mode_banner, #__api_assertion_fab, #__aqa_network_panel, [id^="__aqa_"], [class^="__aqa_"], [class*=" __aqa_"]'));
+                } catch (_) { return false; }
+            }
+
             // ── Click capture — promote to interactive parent ────────
             document.addEventListener('click', (e) => {
-                if (e.target.closest('#__assertion_menu') ||
-                    e.target.closest('#__assertion_fab') ||
-                    e.target.id === '__assertion_highlight' ||
-                    e.target.id === '__assertion_mode_banner' ||
-                    e.target.id === '__assertion_fab' ||
-                    e.target.id === '__assertion_menu' ||
-                    window.__assertionLayerInjected && window.__assertionMode) return;
+                if (__aqaIsToolEvent(e.target) ||
+                    (window.__assertionLayerInjected && window.__assertionMode) || window.__networkPanelOpen) return;
                 var target = getInteractiveParent(e.target);
                 console.log('__RECORDER__:' + JSON.stringify({
                     action: 'click',
@@ -661,7 +666,8 @@ class TestEngine:
             document.addEventListener('paste', (e) => {
                 var el = e.target;
                 if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return;
-                if (window.__assertionLayerInjected && window.__assertionMode) return;
+                if (__aqaIsToolEvent(el)) return;
+                if ((window.__assertionLayerInjected && window.__assertionMode) || window.__networkPanelOpen) return;
                 var id = el.id || el.name || (el.placeholder && el.placeholder.slice(0, 20)) || ('el_' + Math.random());
                 clearTimeout(_inputDebounce[id]);
                 _inputDebounce[id] = undefined;
@@ -674,7 +680,8 @@ class TestEngine:
             document.addEventListener('input', (e) => {
                 var el = e.target;
                 if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return;
-                if (window.__assertionLayerInjected && window.__assertionMode) return;
+                if (__aqaIsToolEvent(el)) return;
+                if ((window.__assertionLayerInjected && window.__assertionMode) || window.__networkPanelOpen) return;
                 var id = el.id || el.name || (el.placeholder && el.placeholder.slice(0, 20)) || ('el_' + Math.random());
                 if (_inputDebounce[id] !== undefined) clearTimeout(_inputDebounce[id]);
                 _inputDebounce[id] = setTimeout(function() {
@@ -686,6 +693,7 @@ class TestEngine:
             // Change: only for SELECT and checkbox (text inputs handled by input/paste)
             document.addEventListener('change', (e) => {
                 const el = e.target;
+                if (__aqaIsToolEvent(el)) return;
                 if (el.tagName === 'SELECT') {
                     console.log('__RECORDER__:' + JSON.stringify({
                         action: 'select',
@@ -707,7 +715,8 @@ class TestEngine:
 
             // Keyboard capture (Enter, Tab, Escape)
             document.addEventListener('keydown', (e) => {
-                if (window.__assertionMode) return;
+                if (__aqaIsToolEvent(e.target)) return;
+                if (window.__assertionMode || window.__networkPanelOpen) return;
                 if (['Enter', 'Tab', 'Escape'].includes(e.key)) {
                     console.log('__RECORDER__:' + JSON.stringify({
                         action: 'keypress',
@@ -722,7 +731,8 @@ class TestEngine:
             var _scrollTimer = null;
             var _scrollTarget = null;
             window.addEventListener('scroll', (e) => {
-                if (window.__assertionLayerInjected && window.__assertionMode) return;
+                if (__aqaIsToolEvent(e.target)) return;
+                if ((window.__assertionLayerInjected && window.__assertionMode) || window.__networkPanelOpen) return;
                 clearTimeout(_scrollTimer);
                 _scrollTarget = e.target === document ? document.documentElement : e.target;
                 _scrollTimer = setTimeout(function() {

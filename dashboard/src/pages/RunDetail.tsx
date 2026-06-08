@@ -27,6 +27,25 @@ function parseAssertions(resultJson: string | undefined): Record<number, Asserti
   }
 }
 
+function ApiEndpointBadge({ endpoint }: { endpoint: string }) {
+  const [method, ...rest] = endpoint.split(' ');
+  const path = rest.join(' ');
+  const methodColors: Record<string, string> = {
+    GET: 'bg-emerald-500/20 text-emerald-300',
+    POST: 'bg-blue-500/20 text-blue-300',
+    PUT: 'bg-amber-500/20 text-amber-300',
+    PATCH: 'bg-orange-500/20 text-orange-300',
+    DELETE: 'bg-red-500/20 text-red-300',
+  };
+  const mc = methodColors[method] ?? 'bg-slate-500/20 text-slate-300';
+  return (
+    <span className="inline-flex items-center gap-0 rounded overflow-hidden font-mono text-xs mr-1 ring-1 ring-inset ring-white/10">
+      <span className={`px-1.5 py-0.5 font-bold ${mc}`}>{method}</span>
+      <span className="px-1.5 py-0.5 bg-surface-2 text-text-muted">{path}</span>
+    </span>
+  );
+}
+
 function AssertionRow({ assertion }: { assertion: AssertionResult }) {
   const passed = assertion.status === 'passed';
   return (
@@ -44,6 +63,7 @@ function AssertionRow({ assertion }: { assertion: AssertionResult }) {
           <span className={`text-xs font-bold uppercase tracking-wide ${passed ? 'text-emerald-400' : 'text-red-400'}`}>
             {assertion.assertion_type.replace(/_/g, ' ')}
           </span>
+          {assertion.api_endpoint && <ApiEndpointBadge endpoint={assertion.api_endpoint} />}
           {assertion.healed && (
             <span className="text-xs font-semibold px-1.5 py-0.5 rounded-md bg-violet-500/15 text-violet-400 ring-1 ring-inset ring-violet-500/20">healed</span>
           )}
@@ -51,7 +71,7 @@ function AssertionRow({ assertion }: { assertion: AssertionResult }) {
             <span className="text-xs text-text-muted font-mono">conf: {assertion.confidence.toFixed(2)}</span>
           )}
         </div>
-        <p className="text-sm text-text-muted mt-0.5">{assertion.message}</p>
+        <p className="text-sm text-text-muted mt-0.5 break-all">{assertion.message}</p>
       </div>
     </div>
   );

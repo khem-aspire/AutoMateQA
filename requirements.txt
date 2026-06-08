@@ -11,3 +11,5 @@ Pillow>=10.0.0
 # API assertions (Phase 1): JSONPath + JSON schema
 jsonpath-ng>=1.6.1
 jsonschema>=4.23.0
+# API assertions (Phase 1): local fixture server for smoke tests
+aiohttp>=3.10

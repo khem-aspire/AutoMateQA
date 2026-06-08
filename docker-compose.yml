@@ -7,7 +7,7 @@ services:
       MYSQL_ROOT_PASSWORD: automateqa
       MYSQL_DATABASE: automateqa
     ports:
-      - "3306:3306"
+      - "3366:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -49,6 +49,10 @@ services:
       "
 
   # ── FastAPI Backend ─────────────────────────────────────────────
+  # Source code (engine/ server/) is mounted from the host so Python changes
+  # are reflected immediately — no image rebuild needed.
+  # AQA_RELOAD defaults to true so uvicorn watches for file changes.
+  # Override in .env: AQA_RELOAD=false  AQA_WORKERS=4  (for production)
   backend:
     build:
       context: .
@@ -61,6 +65,10 @@ services:
         condition: service_completed_successfully
     ports:
       - "8000:8000"
+    volumes:
+      - ./engine:/app/engine
+      - ./server:/app/server
+      - ./cli.py:/app/cli.py
     environment:
       # Database
       AQA_DB_HOST: mysql
@@ -89,15 +97,19 @@ services:
       AQA_HEADLESS: "true"
       AQA_BROWSER: chromium
 
-      # Server
-      AQA_WORKERS: "1"
-      AQA_LOG_LEVEL: info
+      # Server — AQA_RELOAD=true enables uvicorn --reload (forces workers=1)
+      AQA_RELOAD: "${AQA_RELOAD:-true}"
+      AQA_WORKERS: "${AQA_WORKERS:-1}"
+      AQA_LOG_LEVEL: "${AQA_LOG_LEVEL:-info}"
       PYTHONUNBUFFERED: "1"
     env_file:
       - path: .env
         required: false
 
   # ── React Frontend (nginx) ──────────────────────────────────────
+  # After any frontend change run `cd dashboard && npm run build`
+  # then `docker-compose restart frontend` — the volume mount picks it up
+  # without rebuilding the image.
   frontend:
     build:
       context: .
@@ -107,6 +119,8 @@ services:
       - backend
     ports:
       - "3000:80"
+    volumes:
+      - ./dashboard/dist:/usr/share/nginx/html:ro
 
 volumes:
   mysql_data:

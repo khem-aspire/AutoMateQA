@@ -32,8 +32,23 @@ echo "==> Running database migrations..."
 alembic -c server/alembic/alembic.ini upgrade head
 
 echo "==> Starting AutoMateQA Dashboard API..."
-exec uvicorn server.main:app \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --workers "${AQA_WORKERS:-1}" \
-    --log-level "${AQA_LOG_LEVEL:-info}"
+
+# Reload mode: watch source files and restart on changes.
+# Forces workers=1 (uvicorn --reload is incompatible with multiple workers).
+if [ "${AQA_RELOAD:-false}" = "true" ]; then
+    echo "==> Hot-reload enabled (workers forced to 1)"
+    exec uvicorn server.main:app \
+        --host 0.0.0.0 \
+        --port 8000 \
+        --workers 1 \
+        --reload \
+        --reload-dir /app/engine \
+        --reload-dir /app/server \
+        --log-level "${AQA_LOG_LEVEL:-info}"
+else
+    exec uvicorn server.main:app \
+        --host 0.0.0.0 \
+        --port 8000 \
+        --workers "${AQA_WORKERS:-1}" \
+        --log-level "${AQA_LOG_LEVEL:-info}"
+fi

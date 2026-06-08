@@ -82,6 +82,7 @@ export interface AssertionResult {
   message: string;
   confidence: number;
   healed: boolean;
+  api_endpoint?: string;
 }
 
 export interface StepResult {

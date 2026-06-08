@@ -79,25 +79,28 @@ class RecorderEngine:
         return self._model
 
     def handle_assertion(self, payload: dict) -> None:
-        """
-        Called by BrowserManager when an assertion is received from the JS layer.
-        Attaches the assertion to the most recent user-action step.
-
-        Even if the page navigated (e.g. click on a link), the assertion
-        goes on the click step — during execution the engine waits for the
-        destination page to load before evaluating assertions.
-        """
         if not self._recording:
             return
 
         assertion_type = payload.get("assertion_type", "visible")
         fp_data = payload.get("fingerprint", {})
 
+        api_spec_data = payload.get("api_spec")
+        api_spec = None
+        if assertion_type == "api_call" and isinstance(api_spec_data, dict):
+            from engine.models import ApiAssertionSpec
+            try:
+                api_spec = ApiAssertionSpec(**api_spec_data)
+            except Exception as e:
+                logger.warning("Invalid api_spec payload: %s", e)
+                return
+
         assertion = Assertion(
             assertion_type=AssertionType(assertion_type),
             fingerprint=ElementFingerprint(**fp_data),
             expected_value=payload.get("value", ""),
             attribute_name=payload.get("attribute_name", ""),
+            api_spec=api_spec,
         )
 
         if self._model.steps:

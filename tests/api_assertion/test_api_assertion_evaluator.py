@@ -38,11 +38,17 @@ def _assertion(**overrides):
 
 
 def _page_with_response(response):
+    """Simulate a page where the given response arrives once a listener subscribes."""
     page = MagicMock()
-    page.wait_for_response = AsyncMock(return_value=response)
-    page.wait_for_load_state = AsyncMock()
-    page.on = MagicMock()
+    def _on(event, cb):
+        if event == "response" and response is not None:
+            asyncio.get_event_loop().call_soon(cb, response)
+    page.on = MagicMock(side_effect=_on)
     page.remove_listener = MagicMock()
+    # Block networkidle so the listener wins the race
+    async def _never_idle(*_a, **_kw):
+        await asyncio.Event().wait()
+    page.wait_for_load_state = _never_idle
     return page
 
 
@@ -235,14 +241,9 @@ class TestResponseTime(unittest.TestCase):
 class TestMatchFailure(unittest.TestCase):
     def test_networkidle_without_match(self):
         page = MagicMock()
-        never = asyncio.Event()
-
-        async def _wfr(predicate):
-            await never.wait()
-        page.wait_for_response = _wfr
-        page.wait_for_load_state = AsyncMock()
-        page.on = MagicMock()
+        page.on = MagicMock()  # listener never fires
         page.remove_listener = MagicMock()
+        page.wait_for_load_state = AsyncMock()  # resolves immediately
         ev = ApiAssertionEvaluator(EngineConfig(api_assertion_match_timeout_ms=500))
         ev._step_window = [
             {"method": "POST", "url": "https://x.com/api/profile", "status": 200, "duration_ms": 120},

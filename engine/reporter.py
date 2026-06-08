@@ -110,6 +110,8 @@ class ReportGenerator:
                             "type": a.assertion_type,
                             "status": a.status.value,
                             "message": a.message,
+                            "api_endpoint": a.api_endpoint,
+                            "diagnostic": a.diagnostic,
                         }
                         for a in s.assertions
                     ],
@@ -143,7 +145,27 @@ class ReportGenerator:
             assertions_html = ""
             for a in s.assertions:
                 a_icon = "✅" if a.status == StepStatus.PASSED else "❌"
-                assertions_html += f'<div class="assertion">{a_icon} {_html_escape(a.assertion_type)}: {_html_escape(a.message)}</div>'
+                endpoint_badge = ""
+                if a.api_endpoint:
+                    parts = a.api_endpoint.split(" ", 1)
+                    method_html = _html_escape(parts[0])
+                    path_html = _html_escape(parts[1]) if len(parts) > 1 else ""
+                    endpoint_badge = (
+                        f'<span class="api-badge">'
+                        f'<span class="api-method">{method_html}</span>'
+                        f'<span class="api-path">{path_html}</span>'
+                        f'</span> '
+                    )
+                assertions_html += (
+                    f'<div class="assertion">{a_icon} {endpoint_badge}'
+                    f'{_html_escape(a.assertion_type)}: {_html_escape(a.message)}</div>'
+                )
+                if a.diagnostic:
+                    diag_json = json.dumps(a.diagnostic, indent=2, default=str)
+                    assertions_html += (
+                        '<details class="diagnostic"><summary>Diagnostic</summary>'
+                        f'<pre>{_html_escape(diag_json)}</pre></details>'
+                    )
 
             step_rows += f"""
             <tr class="{row_class}">
@@ -181,6 +203,10 @@ class ReportGenerator:
   .healed-badge {{ background: #854d0e; color: #fef3c7; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; }}
   .error {{ color: #f87171; }}
   .assertion {{ font-size: 0.8rem; color: #94a3b8; margin-top: 4px; }}
+  .api-badge {{ display: inline-flex; align-items: center; gap: 0; margin-right: 5px; border-radius: 4px; overflow: hidden; font-size: 0.72rem; font-family: monospace; vertical-align: middle; }}
+  .api-method {{ background: #166534; color: #86efac; padding: 1px 5px; font-weight: 700; }}
+  .api-path {{ background: #1e293b; color: #7dd3fc; padding: 1px 6px; }}
+  .diagnostic {{ margin-top: 4px; }} .diagnostic summary {{ color: #64748b; font-size: 0.75rem; cursor: pointer; }}
   .footer {{ margin-top: 2rem; text-align: center; color: #475569; font-size: 0.8rem; }}
 </style>
 </head>

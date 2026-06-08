@@ -57,12 +57,14 @@ class ApiAssertionEvaluator:
                 timing = getattr(resp.request, "timing", None) or {}
                 end = float(timing.get("responseEnd") or 0.0)
                 start = float(timing.get("startTime") or 0.0)
-                self._step_window.append({
+                entry = {
                     "method": resp.request.method,
                     "url": resp.url,
                     "status": resp.status,
                     "duration_ms": max(0, int(end - start)),
-                })
+                    "_response_ref": resp,
+                }
+                self._step_window.append(entry)
             except Exception:
                 pass
 
@@ -98,6 +100,8 @@ class ApiAssertionEvaluator:
             result.message = "API_CALL assertion missing api_spec"
             return result
 
+        result.api_endpoint = f"{spec.method} {spec.path_template}"
+
         matched = await self._await_match(page, spec)
         if matched is None:
             result.status = StepStatus.FAILED
@@ -119,24 +123,48 @@ class ApiAssertionEvaluator:
         self, page: Page, spec: ApiAssertionSpec
     ) -> Optional[Response]:
         predicate = self._make_predicate(spec)
-        match_task = asyncio.create_task(page.wait_for_response(predicate))
-        idle_task = asyncio.create_task(page.wait_for_load_state("networkidle"))
+
+        # 1. Historical scan: a matching response may already have fired
+        #    before this assertion was evaluated (captured by start_step_window).
+        for entry in self._step_window:
+            ref = entry.get("_response_ref")
+            if ref is not None:
+                try:
+                    if predicate(ref):
+                        return ref
+                except Exception:
+                    pass
+
+        # 2. Live listener with a bounded wait.
+        #    Note: we intentionally do NOT race against wait_for_load_state("networkidle")
+        #    because on an already-idle SPA page it resolves immediately and masks
+        #    a legitimately-pending matching request.
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+
+        def _on_response(resp: Response) -> None:
+            if future.done():
+                return
+            try:
+                if predicate(resp):
+                    future.set_result(resp)
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
         timeout_s = max(0.1, self._config.api_assertion_match_timeout_ms / 1000.0)
 
-        done, pending = await asyncio.wait(
-            {match_task, idle_task},
-            return_when=asyncio.FIRST_COMPLETED,
-            timeout=timeout_s,
-        )
-
-        for t in pending:
-            t.cancel()
-
-        if match_task in done and not match_task.cancelled():
-            exc = match_task.exception()
-            if exc is None:
-                return match_task.result()
-        return None
+        try:
+            return await asyncio.wait_for(future, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return None
+        except Exception:
+            return None
+        finally:
+            try:
+                page.remove_listener("response", _on_response)
+            except Exception:
+                pass
 
     @staticmethod
     def _make_predicate(spec: ApiAssertionSpec):
@@ -185,11 +213,15 @@ class ApiAssertionEvaluator:
                 "url": matched.url,
                 "status": matched.status,
             }
+        serializable_window = [
+            {k: v for k, v in entry.items() if k != "_response_ref"}
+            for entry in self._step_window
+        ]
         return {
             "expected": expected,
             "observed": {
                 "matched_call": observed_match,
-                "step_network_window": list(self._step_window),
+                "step_network_window": serializable_window,
             },
         }
 

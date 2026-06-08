@@ -319,6 +319,28 @@ Confidence = 0.4 * T + 0.2 * R + 0.15 * A + 0.15 * P + 0.1 * D
 | `js_expression` | Arbitrary JavaScript evaluates to truthy |
 | `accessibility` | Basic a11y check (role, aria-label, focusability) |
 
+### API Assertions (Phase 1)
+
+During recording, open the 🌐 Network Panel from the floating toolbar:
+
+1. Pick any XHR/fetch call captured since the last action.
+2. Choose a target tab: Status, Request/Response body (JSONPath), Headers, Schema, Timing.
+3. Click a value in the JSON tree to auto-build the path, or edit freely.
+4. Save — the assertion is attached to the current step.
+
+At playback, the engine waits for the matching call (method + path template)
+up to `api_assertion_match_timeout_ms` (10s default) racing against
+`networkidle`. On failure, the report includes a `diagnostic` block listing
+every XHR/fetch seen during the step window.
+
+Config flags (in `EngineConfig`):
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `api_assertions_enabled` | `True` | Master toggle. |
+| `api_assertion_match_timeout_ms` | `10000` | Per-assertion wait ceiling. |
+| `redact_in_ui` | `True` | Mask Bearer / token / password / apiKey in the Panel tree view. |
+
 ## CI/CD Integration
 
 ### GitHub Actions

@@ -1,7 +1,8 @@
 """AssertionEngine must dispatch API_CALL to ApiAssertionEvaluator."""
 
+import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 from engine.assertions import AssertionEngine
 from engine.models import (
@@ -20,13 +21,19 @@ class TestDispatcherWiring(unittest.TestCase):
         selector_engine = MagicMock()
         ae = AssertionEngine(config, selector_engine, healing_engine=None)
 
+        response = make_mock_response(status=200, url="https://x.com/api/x")
+
         page = MagicMock()
-        page.wait_for_response = AsyncMock(
-            return_value=make_mock_response(status=200, url="https://x.com/api/x")
-        )
-        page.wait_for_load_state = AsyncMock()
-        page.on = MagicMock()
+
+        def _on(event, cb):
+            if event == "response":
+                asyncio.get_event_loop().call_soon(cb, response)
+        page.on = MagicMock(side_effect=_on)
         page.remove_listener = MagicMock()
+
+        async def _never_idle(*_a, **_kw):
+            await asyncio.Event().wait()
+        page.wait_for_load_state = _never_idle
 
         assertion = Assertion(
             assertion_type=AssertionType.API_CALL,
