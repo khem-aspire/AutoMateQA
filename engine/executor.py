@@ -52,6 +52,75 @@ class StepExecutor:
         self._healer = healing_engine
 
     # ------------------------------------------------------------------
+    # Per-action timeout (Phase 10)
+    # ------------------------------------------------------------------
+
+    def _get_timeout(self, action_type: ActionType) -> float:
+        """Return timeout in seconds based on action type."""
+        match action_type:
+            case ActionType.NAVIGATE:
+                return self._config.timeout_navigate_ms / 1000.0
+            case ActionType.CLICK | ActionType.DBLCLICK | ActionType.RIGHT_CLICK:
+                return self._config.timeout_click_ms / 1000.0
+            case ActionType.TYPE:
+                return self._config.timeout_type_ms / 1000.0
+            case _:
+                return self._config.timeout_default_ms / 1000.0
+
+    # ------------------------------------------------------------------
+    # Smart retry with backoff (Phase 10)
+    # ------------------------------------------------------------------
+
+    async def execute_with_retry(
+        self,
+        page: Page,
+        step: TestStep,
+        screenshot_dir: Optional[Path] = None,
+    ) -> StepResult:
+        """Execute a step with configurable retry strategy."""
+        if self._config.retry_strategy == "none":
+            result = await self.execute(page, step, screenshot_dir)
+            result.action_type = step.action.action_type.value
+            return result
+
+        last_result: Optional[StepResult] = None
+        for attempt in range(1, self._config.max_step_retries + 1):
+            result = await self.execute(page, step, screenshot_dir)
+            result.retry_count = attempt - 1
+            result.action_type = step.action.action_type.value
+
+            if result.status in (StepStatus.PASSED, StepStatus.HEALED):
+                return result
+
+            last_result = result
+            if attempt >= self._config.max_step_retries:
+                break
+
+            delay = self._compute_backoff_delay(attempt)
+            logger.info(
+                "Step %d failed (attempt %d/%d) — retrying in %dms",
+                step.step_id, attempt, self._config.max_step_retries, delay,
+            )
+            await asyncio.sleep(delay / 1000)
+
+        return last_result or StepResult(
+            step_id=step.step_id,
+            status=StepStatus.FAILED,
+            error="All retries exhausted",
+            retry_count=self._config.max_step_retries,
+            action_type=step.action.action_type.value,
+        )
+
+    def _compute_backoff_delay(self, attempt: int) -> int:
+        """Compute delay in ms based on retry strategy and attempt number."""
+        base = self._config.retry_base_delay_ms
+        if self._config.retry_strategy == "exponential":
+            return base * (2 ** (attempt - 1))
+        if self._config.retry_strategy == "linear":
+            return base * attempt
+        return base
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -277,6 +346,59 @@ class StepExecutor:
         except Exception:
             pass
 
+    async def _wait_for_animations(self, page: Page) -> None:
+        """Wait for all CSS animations and transitions to complete (Phase 11)."""
+        try:
+            await page.evaluate("""() => {
+                const animations = document.getAnimations();
+                if (animations.length === 0) return Promise.resolve();
+                return Promise.all(animations.map(a => a.finished.catch(() => {})));
+            }""")
+        except Exception:
+            pass
+
+    async def _wait_for_no_spinners(self, page: Page) -> None:
+        """Wait until common loading indicators disappear (Phase 11)."""
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const spinners = document.querySelectorAll(
+                        '[class*="spinner"], [class*="loading"], [class*="skeleton"], '
+                        + '[aria-busy="true"], [data-loading="true"], '
+                        + '.ant-spin-spinning, .MuiCircularProgress-root, '
+                        + '.el-loading-mask'
+                    );
+                    return spinners.length === 0;
+                }""",
+                timeout=8000,
+            )
+        except Exception:
+            pass
+
+    async def _wait_for_network_targeted(
+        self, page: Page, step: TestStep, timeout_ms: int,
+    ) -> None:
+        """Wait for a specific API call if network context is available (Phase 9/11)."""
+        if (
+            step.network_context
+            and step.network_context.critical_url_pattern
+        ):
+            pattern = step.network_context.critical_url_pattern
+            try:
+                await page.wait_for_response(
+                    lambda r: pattern in r.url,
+                    timeout=min(timeout_ms, 15_000),
+                )
+            except Exception:
+                logger.debug("Targeted network wait timed out for: %s", pattern)
+        else:
+            try:
+                await page.wait_for_load_state(
+                    "networkidle", timeout=min(10_000, timeout_ms),
+                )
+            except Exception:
+                pass
+
     async def _wait_after_action(
         self,
         page: Page,
@@ -287,10 +409,12 @@ class StepExecutor:
     ) -> None:
         """Wait for the page to stabilize after a user action.
 
-        Strategy:
-          1. If the URL changed → wait for the browser 'load' event.
-          2. Wait for network to become idle (API responses).
-          3. Wait for DOM mutations to settle (SPA rendering).
+        Enhanced pipeline (Phase 11):
+          1. URL change → wait for load state
+          2. Network-aware wait (targeted or networkidle)
+          3. CSS animation completion
+          4. Spinner/loading detection
+          5. DOM mutation idle
         """
         to_ms = int(step_timeout * 1000)
         if page.url != url_before:
@@ -299,14 +423,22 @@ class StepExecutor:
             except Exception:
                 pass
 
-        try:
-            await page.wait_for_load_state(
-                "networkidle",
-                timeout=min(10_000, to_ms),
-            )
-        except Exception:
-            pass
+        # Network-aware wait
+        if step:
+            await self._wait_for_network_targeted(page, step, to_ms)
+        else:
+            try:
+                await page.wait_for_load_state("networkidle", timeout=min(10_000, to_ms))
+            except Exception:
+                pass
 
+        # Animation completion
+        await self._wait_for_animations(page)
+
+        # Spinner detection
+        await self._wait_for_no_spinners(page)
+
+        # DOM mutation idle
         idle_ms = getattr(self._config, "wait_dom_idle_ms", 600)
         try:
             await page.wait_for_function(
@@ -438,6 +570,14 @@ class StepExecutor:
                 await locator.press(action.value)
             case ActionType.SCROLL:
                 await self._do_scroll(page, action, locator)
+            case ActionType.DRAG_AND_DROP:
+                await self._do_drag_and_drop(page, locator, step)
+            case ActionType.FILE_UPLOAD:
+                await self._do_file_upload(locator, action)
+            case ActionType.RIGHT_CLICK:
+                await locator.click(button="right")
+            case ActionType.FORM_SUBMIT:
+                await locator.evaluate("el => el.closest('form')?.submit()")
             case _:
                 logger.warning("Unhandled action type: %s", action.action_type)
 
@@ -510,6 +650,45 @@ class StepExecutor:
         except Exception:
             if locator is not None:
                 await locator.scroll_into_view_if_needed()
+
+    # ------------------------------------------------------------------
+    # New action handlers (Phase 7)
+    # ------------------------------------------------------------------
+
+    async def _do_drag_and_drop(
+        self, page: Page, source_locator, step: TestStep,
+    ) -> None:
+        """Execute drag-and-drop. Resolve the drop target from action.drag_target."""
+        if step.action.drag_target:
+            target_candidate = await self._selector.resolve(page, step.action.drag_target)
+            if target_candidate:
+                await source_locator.drag_to(target_candidate.locator)
+                return
+        # Fallback: use offset coordinates
+        if step.action.drag_offset_x is not None:
+            box = await source_locator.bounding_box()
+            if box:
+                await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                await page.mouse.down()
+                await page.mouse.move(
+                    step.action.drag_offset_x, step.action.drag_offset_y or 0,
+                )
+                await page.mouse.up()
+                return
+        logger.warning("Drag-and-drop: no target or offset available")
+
+    @staticmethod
+    async def _do_file_upload(locator, action) -> None:
+        """Set files on an input[type=file] element."""
+        import json as _json
+        try:
+            file_names = _json.loads(action.value)
+        except (ValueError, TypeError):
+            file_names = action.file_names or []
+        if file_names:
+            await locator.set_input_files(file_names)
+        else:
+            logger.warning("File upload: no files specified")
 
     # ------------------------------------------------------------------
     # Assertions

@@ -9,10 +9,11 @@ Listens for:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from playwright.async_api import Page
 
@@ -26,22 +27,30 @@ from engine.models import (
     TestStep,
 )
 
+if TYPE_CHECKING:
+    from engine.locator_builder import PlaywrightLocatorBuilder
+    from engine.network_layer import NetworkCaptureLayer
+
 logger = logging.getLogger(__name__)
 
 
 class RecorderEngine:
     """Records user interactions into a TestModel."""
 
-    def __init__(self, model: TestModel) -> None:
+    def __init__(
+        self,
+        model: TestModel,
+        locator_builder: Optional["PlaywrightLocatorBuilder"] = None,
+        network_layer: Optional["NetworkCaptureLayer"] = None,
+    ) -> None:
         self._model = model
         self._page: Optional[Page] = None
         self._recording = False
         self._step_counter = 0
-        # All framenavigated events are suppressed — navigations are always
-        # a side-effect of user actions (click, submit) and are NOT recorded
-        # as separate steps.  Assertions on the destination page attach to
-        # the action step that caused the navigation.
         self._suppress_nav = False
+        self._locator_builder = locator_builder
+        self._network_layer = network_layer
+        self._enrich_tasks: list[asyncio.Task] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -60,32 +69,38 @@ class RecorderEngine:
 
         logger.info("Recorder started")
 
-    def stop(self) -> TestModel:
-        """Stop recording and return the final model."""
+    async def stop(self) -> TestModel:
+        """Stop recording. Awaits pending enrichment tasks before returning."""
         self._recording = False
+        if self._enrich_tasks:
+            await asyncio.gather(*self._enrich_tasks, return_exceptions=True)
+            self._enrich_tasks.clear()
         logger.info("Recorder stopped – %d steps captured", len(self._model.steps))
         return self._model
 
     def handle_assertion(self, payload: dict) -> None:
-        """
-        Called by BrowserManager when an assertion is received from the JS layer.
-        Attaches the assertion to the most recent user-action step.
-
-        Even if the page navigated (e.g. click on a link), the assertion
-        goes on the click step — during execution the engine waits for the
-        destination page to load before evaluating assertions.
-        """
         if not self._recording:
             return
 
         assertion_type = payload.get("assertion_type", "visible")
         fp_data = payload.get("fingerprint", {})
 
+        api_spec_data = payload.get("api_spec")
+        api_spec = None
+        if assertion_type == "api_call" and isinstance(api_spec_data, dict):
+            from engine.models import ApiAssertionSpec
+            try:
+                api_spec = ApiAssertionSpec(**api_spec_data)
+            except Exception as e:
+                logger.warning("Invalid api_spec payload: %s", e)
+                return
+
         assertion = Assertion(
             assertion_type=AssertionType(assertion_type),
             fingerprint=ElementFingerprint(**fp_data),
             expected_value=payload.get("value", ""),
             attribute_name=payload.get("attribute_name", ""),
+            api_spec=api_spec,
         )
 
         if self._model.steps:
@@ -162,6 +177,15 @@ class RecorderEngine:
         self._model.steps.append(step)
         self._suppress_nav = True
 
+        # Capture network context for the step
+        if self._network_layer is not None:
+            step.network_context = self._network_layer.snapshot_and_reset()
+
+        # Non-blocking Playwright locator enrichment
+        if self._locator_builder is not None and self._page is not None:
+            task = asyncio.ensure_future(self._enrich_step(step))
+            self._enrich_tasks.append(task)
+
         preferred = fingerprint.selectors.get("preferred", fingerprint.css_selector)
         logger.info(
             "Recorded step %d: %s (selector=%s)",
@@ -237,6 +261,22 @@ class RecorderEngine:
             target=fingerprint,
         )
 
+    async def _enrich_step(self, step: TestStep) -> None:
+        """Post-step enrichment: populate playwright_locators via ARIA tree."""
+        await asyncio.sleep(0.15)
+        try:
+            if self._page and self._locator_builder:
+                await self._locator_builder.enrich(self._page, step.target)
+                for assertion in step.assertions:
+                    await self._locator_builder.enrich(self._page, assertion.fingerprint)
+                logger.debug(
+                    "Enriched step %d: %s",
+                    step.step_id,
+                    list(step.target.playwright_locators.keys()),
+                )
+        except Exception as e:
+            logger.debug("Enrichment failed for step %d: %s", step.step_id, e)
+
     @staticmethod
     def _map_action_type(action_str: str) -> ActionType:
         mapping = {
@@ -250,5 +290,9 @@ class RecorderEngine:
             "keypress": ActionType.KEYPRESS,
             "scroll": ActionType.SCROLL,
             "navigate": ActionType.NAVIGATE,
+            "drag_and_drop": ActionType.DRAG_AND_DROP,
+            "file_upload": ActionType.FILE_UPLOAD,
+            "right_click": ActionType.RIGHT_CLICK,
+            "form_submit": ActionType.FORM_SUBMIT,
         }
         return mapping.get(action_str, ActionType.CLICK)

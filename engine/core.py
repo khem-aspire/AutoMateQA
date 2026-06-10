@@ -13,20 +13,26 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from engine.assertions import AssertionEngine
 from engine.browser import BrowserManager
+from engine.config import load_settings
+from engine.drift_detector import DriftDetector, FlakinessTracker
 from engine.executor import StepExecutor
 from engine.healer import HealingEngine
+from engine.locator_builder import PlaywrightLocatorBuilder
 from engine.models import (
     EngineConfig,
     HealingMode,
     StepStatus,
     TestModel,
     TestResult,
+    TestSuite,
 )
+from engine.network_layer import NetworkCaptureLayer
 from engine.recorder import RecorderEngine
+from engine.reporter import ReportGenerator
 from engine.selector import SelectorEngine
 
 logger = logging.getLogger(__name__)
@@ -50,22 +56,65 @@ class TestEngine:
 
     def __init__(
         self,
-        llm_enabled: bool = True,
-        healing_mode: str = "strict",
-        confidence_threshold: float = 0.75,
+        llm_enabled: bool = False,
+        healing_mode: Optional[str] = None,
+        confidence_threshold: Optional[float] = None,
         max_healing_attempts: int = 2,
-        headless: bool = False,
+        headless: Optional[bool] = None,
         verbose: bool = False,
-        llm_model: str = "gpt-4o",
+        llm_model: Optional[str] = None,
+        llm_provider: Optional[str] = None,
+        browser_type: Optional[str] = None,
+        device_name: str = "",
+        locale: str = "",
+        timezone: str = "",
+        storage_state_path: str = "",
+        save_storage_state: bool = False,
+        record_har: bool = False,
+        har_path: str = "trace.har",
+        record_trace: bool = False,
+        trace_path: str = "trace.zip",
+        record_video: bool = False,
+        video_dir: str = "videos",
+        enrich_with_playwright_locators: bool = True,
+        capture_network: bool = False,
+        retry_strategy: Optional[str] = None,
+        max_step_retries: Optional[int] = None,
+        report_format: Optional[str] = None,
+        report_path: Optional[str] = None,
     ) -> None:
+        # Load env var defaults, then override with explicit CLI args
+        env = load_settings()
+
         self._config = EngineConfig(
             llm_enabled=llm_enabled,
-            healing_mode=HealingMode(healing_mode),
-            confidence_threshold=confidence_threshold,
+            llm_provider=llm_provider or env.llm_provider,
+            llm_model=llm_model or env.llm_model,
+            llm_api_key=env.llm_api_key,
+            llm_base_url=env.llm_base_url or "",
+            healing_mode=HealingMode(healing_mode or env.healing_mode),
+            confidence_threshold=confidence_threshold if confidence_threshold is not None else env.confidence_threshold,
             max_healing_attempts=max_healing_attempts,
-            headless=headless,
+            headless=headless if headless is not None else env.headless,
             verbose=verbose,
-            llm_model=llm_model,
+            browser_type=browser_type or env.browser_type,
+            device_name=device_name,
+            locale=locale,
+            timezone=timezone,
+            storage_state_path=storage_state_path,
+            save_storage_state=save_storage_state,
+            record_har=record_har,
+            har_path=har_path,
+            record_trace=record_trace,
+            trace_path=trace_path,
+            record_video=record_video,
+            video_dir=video_dir,
+            enrich_with_playwright_locators=enrich_with_playwright_locators,
+            capture_network=capture_network,
+            retry_strategy=retry_strategy or env.retry_strategy,
+            max_step_retries=max_step_retries if max_step_retries is not None else env.max_step_retries,
+            report_format=report_format or env.report_format or "",
+            report_path=report_path or env.report_path or "",
         )
 
         # Sub-components
@@ -80,6 +129,13 @@ class TestEngine:
             self._assertion_engine,
             self._healing_engine,
         )
+        self._locator_builder = PlaywrightLocatorBuilder(self._config)
+        self._drift_detector = DriftDetector()
+        self._flakiness_tracker = FlakinessTracker()
+        # Disable file persistence — drift/flakiness tracked in-memory only during execution
+        self._drift_detector._save = lambda: None
+        self._flakiness_tracker._save = lambda: None
+        self._reporter = ReportGenerator()
 
     @property
     def config(self) -> EngineConfig:
@@ -103,16 +159,36 @@ class TestEngine:
         """
         model = TestModel(name=test_name, base_url=url, config=self._config)
         browser = BrowserManager(self._config)
-        recorder = RecorderEngine(model)
 
-        # Wire assertion callback
-        browser.on_assertion(recorder.handle_assertion)
+        # Enrichment components
+        locator_builder = (
+            self._locator_builder
+            if self._config.enrich_with_playwright_locators
+            else None
+        )
 
         try:
             page = await browser.launch(url=url)
 
-            # Inject the recording script for user-action capture
+            # Network capture (opt-in)
+            network_layer = (
+                NetworkCaptureLayer(page)
+                if self._config.capture_network
+                else None
+            )
+
+            recorder = RecorderEngine(
+                model,
+                locator_builder=locator_builder,
+                network_layer=network_layer,
+            )
+
+            # Wire assertion callback
+            browser.on_assertion(recorder.handle_assertion)
+
+            # Inject the recording scripts for user-action capture
             await self._inject_recorder_script(page)
+            await self._inject_recorder_v2_script(page)
 
             await recorder.start(page)
 
@@ -130,7 +206,7 @@ class TestEngine:
         except KeyboardInterrupt:
             logger.info("Recording interrupted by user")
         finally:
-            final_model = recorder.stop()
+            final_model = await recorder.stop()
             final_model.updated_at = datetime.now(timezone.utc).isoformat()
             await browser.close()
 
@@ -148,6 +224,7 @@ class TestEngine:
         test_path: str = "",
         test_model: Optional[TestModel] = None,
         screenshot_dir: str = "screenshots",
+        on_step_complete: Optional[Callable] = None,
     ) -> TestResult:
         """
         Load a test model and replay it, returning structured results.
@@ -175,14 +252,36 @@ class TestEngine:
         try:
             page = await browser.launch(url=test_model.base_url)
 
+            # Attach assertion listeners for network/console assertions
+            self._assertion_engine.attach_listeners(page)
+
             for step in test_model.steps:
                 logger.info(
                     "▶ Step %d: %s", step.step_id, step.action.action_type.value
                 )
-                step_result = await self._step_executor.execute(
+                step_result = await self._step_executor.execute_with_retry(
                     page, step, screenshot_dir=ss_dir
                 )
                 result.steps.append(step_result)
+
+                # Notify caller of step completion (used by dashboard)
+                if on_step_complete is not None:
+                    await on_step_complete(step_result, len(test_model.steps))
+
+                # Track flakiness and drift
+                step_key = f"{test_model.test_id}:{step.step_id}"
+                self._flakiness_tracker.record(
+                    step_key, step_result.status != StepStatus.FAILED,
+                )
+                step_result.flakiness_score = self._flakiness_tracker.flakiness_score(step_key)
+
+                if step_result.element_confidence > 0:
+                    self._drift_detector.record_confidence(
+                        test_model.test_id,
+                        step.step_id,
+                        strategy="",
+                        confidence=step_result.element_confidence,
+                    )
 
                 # Log step outcome
                 icon = (
@@ -191,12 +290,13 @@ class TestEngine:
                     else "🔧" if step_result.status == StepStatus.HEALED else "❌"
                 )
                 logger.info(
-                    "  %s Step %d: %s (confidence=%.2f, healed=%s)",
+                    "  %s Step %d: %s (confidence=%.2f, healed=%s, retries=%d)",
                     icon,
                     step_result.step_id,
                     step_result.status.value,
                     step_result.element_confidence,
                     step_result.healed,
+                    step_result.retry_count,
                 )
 
                 # Abort on failure if not in auto-heal mode
@@ -210,7 +310,10 @@ class TestEngine:
 
         result.finished_at = datetime.now(timezone.utc).isoformat()
 
-        # Compute overall status
+        # Compute stats
+        result.healed_count = sum(1 for s in result.steps if s.status == StepStatus.HEALED)
+        result.failed_count = sum(1 for s in result.steps if s.status == StepStatus.FAILED)
+
         if all(
             s.status in (StepStatus.PASSED, StepStatus.HEALED) for s in result.steps
         ):
@@ -218,19 +321,21 @@ class TestEngine:
         else:
             result.status = StepStatus.FAILED
 
-        # Compute total duration
         result.total_duration_ms = sum(s.duration_ms for s in result.steps)
 
-        # Persist test model when AUTO_UPDATE healed any step so next run uses healed selectors
+        # Persist healed selectors
         if (
             test_path
             and self._config.healing_mode == HealingMode.AUTO_UPDATE
             and any(s.healed for s in result.steps)
         ):
             self._save_model(test_model, test_path)
-            logger.info(
-                "Saved test model to %s (healed selectors persisted)",
-                test_path,
+            logger.info("Saved healed selectors → %s", test_path)
+
+        # Generate report
+        if self._config.report_format and self._config.report_path:
+            await self._reporter.generate(
+                result, self._config.report_format, self._config.report_path,
             )
 
         return result
@@ -241,16 +346,35 @@ class TestEngine:
 
     @staticmethod
     def _save_model(model: TestModel, path: str) -> None:
+        """Save test model. Uses gzip compression for .aqa files, plain JSON for .json."""
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(model.model_dump_json(indent=2), encoding="utf-8")
+        # exclude_none removes null fields; exclude_unset would be too aggressive
+        json_bytes = model.model_dump_json(indent=2, exclude_none=True).encode("utf-8")
+
+        if p.suffix == ".aqa":
+            import gzip
+            with gzip.open(p, "wb", compresslevel=6) as f:
+                f.write(json_bytes)
+            ratio = len(json_bytes) / max(p.stat().st_size, 1)
+            logger.info("Saved %s (%.1fx compression)", p, ratio)
+        else:
+            p.write_bytes(json_bytes)
 
     @staticmethod
     def _load_model(path: str) -> TestModel:
+        """Load test model. Supports both .aqa (gzip) and .json files."""
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError(f"Test file not found: {path}")
-        raw = p.read_text(encoding="utf-8")
+
+        if p.suffix == ".aqa":
+            import gzip
+            with gzip.open(p, "rb") as f:
+                raw = f.read().decode("utf-8")
+        else:
+            raw = p.read_text(encoding="utf-8")
+
         return TestModel.model_validate_json(raw)
 
     async def _inject_recorder_script(self, page) -> None:
@@ -492,15 +616,20 @@ class TestEngine:
                 };
             }
 
+            // AutoMateQA's own injected UI (FABs, Network Panel, builder controls).
+            // Any event inside this UI is the tester driving the tool — never record it.
+            function __aqaIsToolEvent(t) {
+                try {
+                    if (!t || t.nodeType !== 1) t = (t && t.parentElement) || null;
+                    return !!(t && t.closest &&
+                        t.closest('#__assertion_fab, #__assertion_menu, #__assertion_highlight, #__assertion_mode_banner, #__api_assertion_fab, #__aqa_network_panel, [id^="__aqa_"], [class^="__aqa_"], [class*=" __aqa_"]'));
+                } catch (_) { return false; }
+            }
+
             // ── Click capture — promote to interactive parent ────────
             document.addEventListener('click', (e) => {
-                if (e.target.closest('#__assertion_menu') ||
-                    e.target.closest('#__assertion_fab') ||
-                    e.target.id === '__assertion_highlight' ||
-                    e.target.id === '__assertion_mode_banner' ||
-                    e.target.id === '__assertion_fab' ||
-                    e.target.id === '__assertion_menu' ||
-                    window.__assertionLayerInjected && window.__assertionMode) return;
+                if (__aqaIsToolEvent(e.target) ||
+                    (window.__assertionLayerInjected && window.__assertionMode) || window.__networkPanelOpen) return;
                 var target = getInteractiveParent(e.target);
                 console.log('__RECORDER__:' + JSON.stringify({
                     action: 'click',
@@ -537,7 +666,8 @@ class TestEngine:
             document.addEventListener('paste', (e) => {
                 var el = e.target;
                 if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return;
-                if (window.__assertionLayerInjected && window.__assertionMode) return;
+                if (__aqaIsToolEvent(el)) return;
+                if ((window.__assertionLayerInjected && window.__assertionMode) || window.__networkPanelOpen) return;
                 var id = el.id || el.name || (el.placeholder && el.placeholder.slice(0, 20)) || ('el_' + Math.random());
                 clearTimeout(_inputDebounce[id]);
                 _inputDebounce[id] = undefined;
@@ -550,7 +680,8 @@ class TestEngine:
             document.addEventListener('input', (e) => {
                 var el = e.target;
                 if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return;
-                if (window.__assertionLayerInjected && window.__assertionMode) return;
+                if (__aqaIsToolEvent(el)) return;
+                if ((window.__assertionLayerInjected && window.__assertionMode) || window.__networkPanelOpen) return;
                 var id = el.id || el.name || (el.placeholder && el.placeholder.slice(0, 20)) || ('el_' + Math.random());
                 if (_inputDebounce[id] !== undefined) clearTimeout(_inputDebounce[id]);
                 _inputDebounce[id] = setTimeout(function() {
@@ -562,6 +693,7 @@ class TestEngine:
             // Change: only for SELECT and checkbox (text inputs handled by input/paste)
             document.addEventListener('change', (e) => {
                 const el = e.target;
+                if (__aqaIsToolEvent(el)) return;
                 if (el.tagName === 'SELECT') {
                     console.log('__RECORDER__:' + JSON.stringify({
                         action: 'select',
@@ -583,7 +715,8 @@ class TestEngine:
 
             // Keyboard capture (Enter, Tab, Escape)
             document.addEventListener('keydown', (e) => {
-                if (window.__assertionMode) return;
+                if (__aqaIsToolEvent(e.target)) return;
+                if (window.__assertionMode || window.__networkPanelOpen) return;
                 if (['Enter', 'Tab', 'Escape'].includes(e.key)) {
                     console.log('__RECORDER__:' + JSON.stringify({
                         action: 'keypress',
@@ -598,7 +731,8 @@ class TestEngine:
             var _scrollTimer = null;
             var _scrollTarget = null;
             window.addEventListener('scroll', (e) => {
-                if (window.__assertionLayerInjected && window.__assertionMode) return;
+                if (__aqaIsToolEvent(e.target)) return;
+                if ((window.__assertionLayerInjected && window.__assertionMode) || window.__networkPanelOpen) return;
                 clearTimeout(_scrollTimer);
                 _scrollTarget = e.target === document ? document.documentElement : e.target;
                 _scrollTimer = setTimeout(function() {
@@ -616,12 +750,123 @@ class TestEngine:
                 }, 300);
             }, true);
 
+            // Expose fp() for recorder_v2.js to reuse
+            window.__recorderFp = fp;
+
             console.log('__RECORDER_READY__');
         })();
         """
         await page.context.add_init_script(recorder_js)
         # Also evaluate on the current page
         await page.evaluate(recorder_js)
+
+    async def _inject_recorder_v2_script(self, page) -> None:
+        """Inject the extended recorder script (drag-drop, file upload, etc.)."""
+        v2_path = Path(__file__).parent / "js" / "recorder_v2.js"
+        if v2_path.exists():
+            v2_js = v2_path.read_text(encoding="utf-8")
+            await page.context.add_init_script(v2_js)
+            await page.evaluate(v2_js)
+        else:
+            logger.debug("recorder_v2.js not found — skipping extended events")
+
+    # ------------------------------------------------------------------
+    # DRIFT-CHECK mode (Phase 20)
+    # ------------------------------------------------------------------
+
+    async def drift_check(
+        self,
+        test_path: str,
+        threshold: float = 0.6,
+    ) -> list[dict]:
+        """Navigate to base_url and check selectors WITHOUT executing actions."""
+        test_model = self._load_model(test_path)
+        browser = BrowserManager(self._config)
+        alerts: list[dict] = []
+
+        try:
+            page = await browser.launch(url=test_model.base_url)
+
+            for step in test_model.steps:
+                if step.action.action_type.value == "navigate":
+                    continue
+                candidate = await self._selector_engine.resolve(page, step.target)
+                confidence = candidate.confidence if candidate else 0.0
+                if confidence < threshold:
+                    alerts.append({
+                        "step_id": step.step_id,
+                        "action": step.action.action_type.value,
+                        "confidence": round(confidence, 2),
+                        "selector": step.target.css_selector,
+                        "severity": "critical" if confidence < 0.3 else "warning",
+                    })
+        except Exception as e:
+            logger.error("Drift check error: %s", e)
+        finally:
+            await browser.close()
+
+        return alerts
+
+    # ------------------------------------------------------------------
+    # SUITE mode (Phase 18)
+    # ------------------------------------------------------------------
+
+    async def execute_suite(
+        self,
+        suite: TestSuite,
+        screenshot_dir: str = "screenshots",
+    ) -> list[TestResult]:
+        """Execute a test suite (sequential or parallel)."""
+        if suite.parallel:
+            return await self._execute_suite_parallel(suite, screenshot_dir)
+        return await self._execute_suite_sequential(suite, screenshot_dir)
+
+    async def _execute_suite_sequential(
+        self, suite: TestSuite, screenshot_dir: str,
+    ) -> list[TestResult]:
+        results: list[TestResult] = []
+        for path in suite.test_paths:
+            result = await self.execute(test_path=path, screenshot_dir=screenshot_dir)
+            results.append(result)
+            if suite.stop_on_first_failure and result.status == StepStatus.FAILED:
+                logger.warning("Suite stopped: test %s failed", path)
+                break
+        return results
+
+    async def _execute_suite_parallel(
+        self, suite: TestSuite, screenshot_dir: str,
+    ) -> list[TestResult]:
+        semaphore = asyncio.Semaphore(suite.max_workers)
+
+        async def run_one(path: str) -> TestResult:
+            async with semaphore:
+                engine = TestEngine(**self._parallel_config())
+                return await engine.execute(test_path=path, screenshot_dir=screenshot_dir)
+
+        results = await asyncio.gather(
+            *[run_one(p) for p in suite.test_paths],
+            return_exceptions=True,
+        )
+        return [
+            r if isinstance(r, TestResult)
+            else TestResult(status=StepStatus.FAILED, test_name=str(r))
+            for r in results
+        ]
+
+    def _parallel_config(self) -> dict:
+        """Return config kwargs for spawning parallel engine instances."""
+        return {
+            "llm_enabled": self._config.llm_enabled,
+            "healing_mode": self._config.healing_mode.value,
+            "confidence_threshold": self._config.confidence_threshold,
+            "headless": True,  # always headless for parallel
+            "verbose": self._config.verbose,
+            "llm_model": self._config.llm_model,
+            "llm_provider": self._config.llm_provider,
+            "browser_type": self._config.browser_type,
+            "retry_strategy": self._config.retry_strategy,
+            "max_step_retries": self._config.max_step_retries,
+        }
 
     @staticmethod
     async def _wait_for_browser_close(page) -> None:

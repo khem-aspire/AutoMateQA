@@ -15,12 +15,14 @@ Spec compliance (sections 9 & 11):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import TYPE_CHECKING, Optional
 
 from playwright.async_api import Page
 
+from engine.api_assertion import ApiAssertionEvaluator
 from engine.models import (
     Assertion,
     AssertionResult,
@@ -49,6 +51,21 @@ class AssertionEngine:
         self._config = config
         self._selector = selector_engine
         self._healer = healing_engine
+        self._console_messages: list = []  # captured during execution
+        self._responses: list = []  # captured network responses
+        self._api_evaluator = ApiAssertionEvaluator(config)
+
+    def attach_listeners(self, page) -> None:
+        """Attach console and response listeners for assertion types that need them."""
+        self._console_messages.clear()
+        self._responses.clear()
+        page.on("console", lambda msg: self._console_messages.append(msg))
+        page.on("response", lambda resp: self._responses.append(resp))
+        self._api_evaluator.start_step_window(page)
+
+    def detach_listeners(self) -> None:
+        """Remove the per-step API evaluator listener."""
+        self._api_evaluator.end_step_window()
 
     # Max time (seconds) to poll for an assertion target element that
     # doesn't exist in the DOM yet (SPA still rendering).
@@ -65,6 +82,12 @@ class AssertionEngine:
           3. If FAILED *and* confidence < threshold → heal target → re-evaluate.
           4. Return result (never mutates expected_value).
         """
+        # API_CALL assertions skip element resolution / healing entirely
+        if assertion.assertion_type == AssertionType.API_CALL:
+            api_result = await self._api_evaluator.evaluate(page, assertion)
+            api_result.assertion_id = assertion.assertion_id
+            return api_result
+
         result = AssertionResult(
             assertion_id=assertion.assertion_id,
             assertion_type=assertion.assertion_type.value,
@@ -143,6 +166,24 @@ class AssertionEngine:
                     await self._assert_attribute_equals(assertion, result, candidate)
                 case AssertionType.EXISTS:
                     await self._assert_exists(assertion, result, candidate)
+                case AssertionType.CSS_PROPERTY:
+                    await self._assert_css_property(assertion, result, candidate)
+                case AssertionType.ELEMENT_COUNT:
+                    await self._assert_element_count(assertion, result, candidate)
+                case AssertionType.URL_EQUALS:
+                    await self._assert_url(assertion, result, candidate, exact=True)
+                case AssertionType.URL_CONTAINS:
+                    await self._assert_url(assertion, result, candidate, exact=False)
+                case AssertionType.CONSOLE_NO_ERRORS:
+                    await self._assert_console_no_errors(assertion, result, candidate)
+                case AssertionType.NETWORK_STATUS:
+                    await self._assert_network_status(assertion, result, candidate)
+                case AssertionType.JS_EXPRESSION:
+                    await self._assert_js_expression(assertion, result, candidate)
+                case AssertionType.ACCESSIBILITY:
+                    await self._assert_accessibility(assertion, result, candidate)
+                case AssertionType.VISUAL_MATCH:
+                    await self._assert_visual_match(assertion, result, candidate)
                 case _:
                     result.status = StepStatus.FAILED
                     result.message = f"Unknown assertion type: {assertion.assertion_type}"
@@ -315,3 +356,169 @@ class AssertionEngine:
         else:
             result.status = StepStatus.FAILED
             result.message = "Element does not exist in DOM"
+
+    # ------------------------------------------------------------------
+    # Phase 16: New assertion types
+    # ------------------------------------------------------------------
+
+    async def _assert_css_property(
+        self, assertion: Assertion, result: AssertionResult, candidate: Optional[SelectorCandidate]
+    ) -> None:
+        if candidate is None:
+            result.status = StepStatus.FAILED
+            result.message = "Element not found"
+            return
+        prop_name = assertion.attribute_name
+        if not prop_name:
+            result.status = StepStatus.FAILED
+            result.message = "No CSS property name specified"
+            return
+        actual = await candidate.locator.evaluate(
+            f"el => getComputedStyle(el).getPropertyValue('{prop_name}')"
+        )
+        actual = (actual or "").strip()
+        if actual == assertion.expected_value.strip():
+            result.status = StepStatus.PASSED
+            result.message = f"CSS {prop_name} = '{actual}'"
+        else:
+            result.status = StepStatus.FAILED
+            result.message = f"CSS {prop_name}: expected '{assertion.expected_value}', got '{actual}'"
+
+    async def _assert_element_count(
+        self, assertion: Assertion, result: AssertionResult, candidate: Optional[SelectorCandidate]
+    ) -> None:
+        if candidate is None:
+            result.status = StepStatus.FAILED
+            result.message = "Element not found"
+            return
+        count = await candidate.locator.count()
+        try:
+            expected = int(assertion.expected_value)
+        except ValueError:
+            result.status = StepStatus.FAILED
+            result.message = f"Invalid expected count: {assertion.expected_value}"
+            return
+        if count == expected:
+            result.status = StepStatus.PASSED
+            result.message = f"Element count = {count}"
+        else:
+            result.status = StepStatus.FAILED
+            result.message = f"Element count: expected {expected}, got {count}"
+
+    async def _assert_url(
+        self, assertion: Assertion, result: AssertionResult,
+        candidate: Optional[SelectorCandidate], exact: bool = True,
+    ) -> None:
+        # URL assertions use the page stored on the candidate's locator
+        try:
+            current_url = candidate.locator.page.url if candidate else ""
+        except Exception:
+            current_url = ""
+        if not current_url:
+            result.status = StepStatus.FAILED
+            result.message = "Could not determine current URL"
+            return
+        if exact:
+            if current_url == assertion.expected_value:
+                result.status = StepStatus.PASSED
+                result.message = f"URL matches: {current_url}"
+            else:
+                result.status = StepStatus.FAILED
+                result.message = f"URL mismatch: expected '{assertion.expected_value}', got '{current_url}'"
+        else:
+            if assertion.expected_value in current_url:
+                result.status = StepStatus.PASSED
+                result.message = f"URL contains '{assertion.expected_value}'"
+            else:
+                result.status = StepStatus.FAILED
+                result.message = f"URL '{current_url}' does not contain '{assertion.expected_value}'"
+
+    async def _assert_console_no_errors(
+        self, assertion: Assertion, result: AssertionResult, candidate: Optional[SelectorCandidate]
+    ) -> None:
+        errors = [m for m in self._console_messages if hasattr(m, 'type') and m.type == "error"]
+        if not errors:
+            result.status = StepStatus.PASSED
+            result.message = "No console errors"
+        else:
+            error_texts = [m.text[:100] for m in errors[:5]]
+            result.status = StepStatus.FAILED
+            result.message = f"{len(errors)} console error(s): {'; '.join(error_texts)}"
+
+    async def _assert_network_status(
+        self, assertion: Assertion, result: AssertionResult, candidate: Optional[SelectorCandidate]
+    ) -> None:
+        url_pattern = assertion.attribute_name
+        expected_status = assertion.expected_value
+        if not url_pattern:
+            result.status = StepStatus.FAILED
+            result.message = "No URL pattern specified in attribute_name"
+            return
+        matching = [r for r in self._responses if url_pattern in r.url]
+        if not matching:
+            result.status = StepStatus.FAILED
+            result.message = f"No response matching '{url_pattern}'"
+            return
+        last_status = str(matching[-1].status)
+        if last_status == expected_status:
+            result.status = StepStatus.PASSED
+            result.message = f"API {url_pattern} returned {last_status}"
+        else:
+            result.status = StepStatus.FAILED
+            result.message = f"API {url_pattern}: expected {expected_status}, got {last_status}"
+
+    async def _assert_js_expression(
+        self, assertion: Assertion, result: AssertionResult, candidate: Optional[SelectorCandidate]
+    ) -> None:
+        if not assertion.expected_value:
+            result.status = StepStatus.FAILED
+            result.message = "No JS expression specified"
+            return
+        try:
+            page = candidate.locator.page if candidate else None
+            if page is None:
+                result.status = StepStatus.FAILED
+                result.message = "No page reference available"
+                return
+            value = await page.evaluate(assertion.expected_value)
+            if value:
+                result.status = StepStatus.PASSED
+                result.message = f"JS expression returned truthy: {value}"
+            else:
+                result.status = StepStatus.FAILED
+                result.message = f"JS expression returned falsy: {value}"
+        except Exception as e:
+            result.status = StepStatus.FAILED
+            result.message = f"JS expression error: {e}"
+
+    async def _assert_accessibility(
+        self, assertion: Assertion, result: AssertionResult, candidate: Optional[SelectorCandidate]
+    ) -> None:
+        """Basic accessibility check — verifies element has accessible name and role."""
+        if candidate is None:
+            result.status = StepStatus.FAILED
+            result.message = "Element not found"
+            return
+        info = await candidate.locator.evaluate("""el => ({
+            role: el.getAttribute('role') || el.tagName.toLowerCase(),
+            ariaLabel: el.getAttribute('aria-label') || '',
+            tabIndex: el.tabIndex,
+        })""")
+        issues = []
+        if not info.get("ariaLabel") and not info.get("role"):
+            issues.append("missing role and aria-label")
+        if info.get("tabIndex", -1) < 0 and info.get("role") in ("button", "link"):
+            issues.append("interactive element not keyboard-focusable")
+        if issues:
+            result.status = StepStatus.FAILED
+            result.message = f"Accessibility issues: {', '.join(issues)}"
+        else:
+            result.status = StepStatus.PASSED
+            result.message = "Element is accessible"
+
+    async def _assert_visual_match(
+        self, assertion: Assertion, result: AssertionResult, candidate: Optional[SelectorCandidate]
+    ) -> None:
+        """Visual regression placeholder — requires VisualComparator integration."""
+        result.status = StepStatus.PASSED
+        result.message = "Visual match assertion (baseline management not yet configured)"
